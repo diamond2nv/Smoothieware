@@ -1264,10 +1264,32 @@ bool Robot::append_milestone(const float target[], float rate_mm_s)
             actuator_pos[i] = transformed_target[i];
         }
     }
+    
 
 #if MAX_ROBOT_ACTUATORS > 3
-    sos= 0;
-    // for the extruders just copy the position, and possibly scale it from mm³ to mm
+    // As the auxiliary axes (extruders etc.) do not affect the primary toolpath they are also 
+    // not part of the Euclidean distance of the move. In order to scale purely auxiliary moves, it is
+    // better to use the maximum of the absolute distances and not an artificial Euclidean distance.
+    //
+    // Example 1: for a 3D Printer with dual extrusion, printing two objects in parallel (i.e. BCN3D Sigma),
+    // feedrate and acceleration should NOT be scaled down by the Euclidean distance over both extrusions
+    // as this would unexpectedly scale down feedrate and acceleration by 1/sqrt(2). 
+    // 
+    // Example 2: a pick and place machine with two nozzles has two rotation axes for placing parts at the 
+    // correct angle. The two rotations are completely independent, so it does not make sense to calculate 
+    // the Euclidean distance over the two angles and then scale down speed and acceleration of both. 
+    // The same is even more evident, if one axis serves a completely different purpose, such as a 
+    // part feeder, conveyor etc.
+    // 
+    // Example 3: A 4-axis CNC with a rotation axis will need to compile with PAXIS=4 resulting in the macro 
+    // N_PRIMARY_AXIS=4. With the rotation axis, the swing of the tool tip (or workpiece) adds linearly 
+    // (for a given short moment of time dt) to the Euclidean distance, together with the XYZ motion. 
+    // The G code will have to issue fine grained waypoints and feedrates to compensate for the wildly 
+    // varying radii in effect here. In this case axis 4 cannot be part of an auxiliary move and 
+    // therefore the maximum distance determination - correctly - does not apply.
+    
+    float max_dist = 0;
+    // for the secondary axes (extruders, rotation axes etc.) copy the position, and possibly scale it from mm³ to mm
     for (size_t i = E_AXIS; i < n_motors; i++) {
         actuator_pos[i]= transformed_target[i];
         if(actuators[i]->is_extruder() && get_e_scale_fnc) {
@@ -1278,12 +1300,15 @@ bool Robot::append_milestone(const float target[], float rate_mm_s)
             actuator_pos[i] *= get_e_scale_fnc();
         }
         if(auxilliary_move) {
-            // for E only moves we need to use the scaled E to calculate the distance
-            sos += powf(actuator_pos[i] - actuators[i]->get_last_milestone(), 2);
+            // for auxiliary moves we need to use the scaled delta to calculate the distance
+            float d = fabsf(actuator_pos[i] - actuators[i]->get_last_milestone());
+            if (d > max_dist) {
+              max_dist = d;
+            }
         }
     }
     if(auxilliary_move) {
-        distance= sqrtf(sos); // distance in mm of the e move
+        distance= max_dist; // distance in mm of the longest actuator move
         if(distance < 0.00001F) return false;
     }
 #endif
@@ -1293,7 +1318,7 @@ bool Robot::append_milestone(const float target[], float rate_mm_s)
 
     float isecs = rate_mm_s / distance;
 
-    // check per-actuator speed limits
+    // check per-actuator speed and acceleration limits
     for (size_t actuator = 0; actuator < n_motors; actuator++) {
         float d = fabsf(actuator_pos[actuator] - actuators[actuator]->get_last_milestone());
         if(d == 0 || !actuators[actuator]->is_selected()) continue; // no movement for this actuator
@@ -1304,17 +1329,20 @@ bool Robot::append_milestone(const float target[], float rate_mm_s)
             isecs = rate_mm_s / distance;
         }
 
-        // adjust acceleration to lowest found, for now just primary axis unless it is an auxiliary move
-        // TODO we may need to do all of them, check E won't limit XYZ.. it does on long E moves, but not checking it could exceed the E acceleration.
-        if(auxilliary_move || actuator < N_PRIMARY_AXIS) {
-            float ma =  actuators[actuator]->get_acceleration(); // in mm/sec²
-            if(!isnan(ma)) {  // if axis does not have acceleration set then it uses the default_acceleration
-                float ca = fabsf((d/distance) * acceleration);
-                if (ca > ma) {
-                    acceleration *= ( ma / ca );
-                }
-            }
+        // adjust acceleration to lowest found
+        // NOTE we need to do all of them, check ABC won't limit XYZ.. it does on long ABC moves, not checking it could exceed the actuator acceleration.
+        float ma =  actuators[actuator]->get_acceleration(); // in mm/sec²
+        if(isnan(ma)) {  // if axis does not have acceleration set then it uses the default_acceleration
+            // NOTE we take the full 'default_acceleration' and not the running minimum 'acceleration' because 
+            // d can actually be > distance in mixed primary/secondary axes moves and we do not want to 
+            // unduely limit the XYZ move. 
+            ma = default_acceleration;
         }
+        float ca = (d/distance) * acceleration;
+        if (ca > ma) {
+            acceleration *= ( ma / ca );
+        }
+      
     }
 
     // if we are in feed hold wait here until it is released, this means that even segemnted lines will pause
