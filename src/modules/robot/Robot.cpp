@@ -1193,7 +1193,7 @@ bool Robot::append_milestone(const float target[], float rate_mm_s)
 {
     float deltas[n_motors];
     float transformed_target[n_motors]; // adjust target for bed compensation
-    float unit_vec[N_PRIMARY_AXIS];
+    float unit_vec[MAX_ROBOT_ACTUATORS];
 
     // unity transform by default
     memcpy(transformed_target, target, n_motors*sizeof(float));
@@ -1327,13 +1327,12 @@ bool Robot::append_milestone(const float target[], float rate_mm_s)
     ActuatorCoordinates actuator_pos;
 
     if(!auxilliary_move) {
-         for (size_t i = X_AXIS; i < N_PRIMARY_AXIS; i++) {
-            // find distance unit vector for primary axis only
-            unit_vec[i] = deltas[i] / distance;
-
+         for (size_t i = X_AXIS; i < Z_AXIS; i++) {
             // Do not move faster than the configured cartesian limits for XYZ
-            if ( i <= Z_AXIS && max_speeds[i] > 0 ) {
-                float axis_speed = fabsf(unit_vec[i] * rate_mm_s);
+            if (max_speeds[i] > 0 ) {
+                // find distance unit vector for primary axis only
+                float unit_vec_xyz = deltas[i] / distance;
+                float axis_speed = fabsf(unit_vec_xyz * rate_mm_s);
 
                 if (axis_speed > max_speeds[i])
                     rate_mm_s *= ( max_speeds[i] / axis_speed );
@@ -1395,6 +1394,17 @@ bool Robot::append_milestone(const float target[], float rate_mm_s)
     }
 #endif
 
+    float spacial_sos = 0;
+    for (size_t i = 0; i < n_motors; i++) {
+      // find overall spacial distance for junction deviation
+      spacial_sos += powf(deltas[i], 2);
+    }
+    float spacial_distance = sqrtf(spacial_sos);
+    for (size_t i = 0; i < n_motors; i++) {
+      // find distance unit vector for all axes
+      unit_vec[i] = deltas[i] / spacial_distance;
+    }
+
     // use default acceleration to start with
     float acceleration = default_acceleration;
 
@@ -1443,7 +1453,7 @@ bool Robot::append_milestone(const float target[], float rate_mm_s)
     // Append the block to the planner
     // NOTE that distance here should be either the distance travelled by the XYZ axis, or the E mm travel if a solo E move
     // NOTE this call will bock until there is room in the block queue, on_idle will continue to be called
-    if(THEKERNEL->planner->append_block( actuator_pos, n_motors, rate_mm_s, distance, auxilliary_move ? nullptr : unit_vec, acceleration, s_value, is_g123)) {
+    if(THEKERNEL->planner->append_block( actuator_pos, n_motors, rate_mm_s, distance, unit_vec, acceleration, s_value, is_g123)) {
         // this is the new compensated machine position
         memcpy(this->compensated_machine_position, transformed_target, n_motors*sizeof(float));
         return true;
